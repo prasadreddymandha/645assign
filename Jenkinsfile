@@ -1,27 +1,23 @@
 pipeline {
     agent any
-    
     environment {
-        // Update these values
-        DOCKER_REGISTRY = "your-dockerhub-username"    // Your Docker Hub username
-        APP_NAME = "html-app"                          // Your application name
-        DOCKER_IMAGE = "${DOCKER_REGISTRY}/${APP_NAME}"
-        DOCKER_CREDS = credentials('docker-hub-credentials')  // Jenkins credentials ID for Docker Hub
-        GITHUB_CREDS = credentials('github-credentials')      // Jenkins credentials ID for GitHub
-        // Get this from Rancher -> Cluster -> Kubeconfig file
-        KUBECONFIG_CRED = credentials('rancher-kubeconfig')   // Jenkins credentials ID for Rancher kubeconfig
+        DOCKER_CREDENTIALS = credentials('docker-id')  
+        KUBECONFIG_CREDENTIALS = credentials('kubernetes-id')  
+        GIT_CREDENTIALS = credentials('git-id')
+        IMAGE_TAG = "${env.BUILD_ID}"
+        DOCKER_USERNAME = 'prasadreddymanda'
+        APP_NAME = 'html-app'
     }
     
     stages {
         stage('Checkout') {
             steps {
-                // Clone your private GitHub repository
                 checkout([
                     $class: 'GitSCM',
-                    branches: [[name: '*/main']],  // Change if using different branch
+                    branches: [[name: '*/main']],
                     userRemoteConfigs: [[
-                        url: 'YOUR_GITHUB_REPO_URL',  // Your GitHub repo URL
-                        credentialsId: "${GITHUB_CREDS}"
+                        url: 'https://github.com/prasadreddymandha/645assign/tree/main',
+                        credentialsId: 'git-id'
                     ]]
                 ])
             }
@@ -30,10 +26,10 @@ pipeline {
         stage('Build Docker Image') {
             steps {
                 script {
-                    // Build Docker image
-                    sh "docker build -t ${DOCKER_IMAGE}:${BUILD_NUMBER} ."
-                    // Also tag as latest
-                    sh "docker tag ${DOCKER_IMAGE}:${BUILD_NUMBER} ${DOCKER_IMAGE}:latest"
+                    withCredentials([usernamePassword(credentialsId: 'docker-id', passwordVariable: 'DOCKER_PSW', usernameVariable: 'DOCKER_USR')]) {
+                        sh 'echo $DOCKER_PSW | docker login -u $DOCKER_USR --password-stdin'
+                    }
+                    image = docker.build("${DOCKER_USERNAME}/${APP_NAME}:${env.IMAGE_TAG}")
                 }
             }
         }
@@ -41,80 +37,74 @@ pipeline {
         stage('Push Docker Image') {
             steps {
                 script {
-                    // Login and push to Docker Hub
-                    sh """
-                        echo ${DOCKER_CREDS_PSW} | docker login -u ${DOCKER_CREDS_USR} --password-stdin
-                        docker push ${DOCKER_IMAGE}:${BUILD_NUMBER}
-                        docker push ${DOCKER_IMAGE}:latest
-                    """
+                    docker.withRegistry('https://index.docker.io/v1/', 'docker-id') {
+                        image.push()
+                    }
                 }
             }
         }
         
-        stage('Deploy to Rancher Kubernetes') {
+        stage('Deploy to Kubernetes') {
             steps {
                 script {
-                    // Using kubeconfig from Rancher
-                    withCredentials([file(credentialsId: 'rancher-kubeconfig', variable: 'KUBECONFIG')]) {
-                        sh """
-                            # Verify connection to cluster
-                            kubectl --kubeconfig ${KUBECONFIG} get nodes
-                            
-                            # Create namespace if it doesn't exist
-                            kubectl --kubeconfig ${KUBECONFIG} create namespace ${APP_NAME} --dry-run=client -o yaml | kubectl apply -f -
-                            
-                            # Create ConfigMap for HTML content
-                            kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} create configmap ${APP_NAME}-content \
-                                --from-file=index.html --dry-run=client -o yaml | kubectl apply -f -
-                            
-                            # Apply Deployment
-                            cat <<EOF | kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} apply -f -
+                    // Create deployment YAML
+                    sh """
+                    cat <<EOF > deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${APP_NAME}
-  namespace: ${APP_NAME}
+  name: html-app
+  labels:
+    app: html-app
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: ${APP_NAME}
+      app: html-app
   template:
     metadata:
       labels:
-        app: ${APP_NAME}
+        app: html-app
     spec:
       containers:
-      - name: ${APP_NAME}
-        image: ${DOCKER_IMAGE}:${BUILD_NUMBER}
+      - name: html-app
+        image: ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}
         ports:
         - containerPort: 80
-        volumeMounts:
-        - name: html-content
-          mountPath: /usr/share/nginx/html
-      volumes:
-      - name: html-content
-        configMap:
-          name: ${APP_NAME}-content
+        resources:
+          limits:
+            cpu: "0.5"
+            memory: "512Mi"
+          requests:
+            cpu: "0.2"
+            memory: "256Mi"
 EOF
 
-                            # Apply Service
-                            cat <<EOF | kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} apply -f -
+                    # Create service YAML
+                    cat <<EOF > service.yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${APP_NAME}-service
-  namespace: ${APP_NAME}
+  name: html-app-service
+  labels:
+    app: html-app
 spec:
   type: NodePort
-  selector:
-    app: ${APP_NAME}
   ports:
   - port: 80
     targetPort: 80
+    protocol: TCP
+  selector:
+    app: html-app
 EOF
-                        """
-                    }
+
+                    # Create ConfigMap for HTML content
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS create configmap html-content --from-file=index.html -o yaml --dry-run=client | kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f -
+
+                    # Apply Kubernetes configurations
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f deployment.yaml
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f service.yaml
+                    """
                 }
             }
         }
@@ -122,24 +112,11 @@ EOF
         stage('Verify Deployment') {
             steps {
                 script {
-                    withCredentials([file(credentialsId: 'rancher-kubeconfig', variable: 'KUBECONFIG')]) {
-                        sh """
-                            # Wait for deployment to complete
-                            kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} rollout status deployment/${APP_NAME}
-                            
-                            # Get deployment status
-                            echo "Deployment Status:"
-                            kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} get deployments
-                            
-                            # Get pods status
-                            echo "Pod Status:"
-                            kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} get pods
-                            
-                            # Get service details
-                            echo "Service Details:"
-                            kubectl --kubeconfig ${KUBECONFIG} -n ${APP_NAME} get service ${APP_NAME}-service
-                        """
-                    }
+                    sh '''
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS rollout status deployment/html-app
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get pods
+                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get svc html-app-service
+                    '''
                 }
             }
         }
@@ -147,17 +124,22 @@ EOF
     
     post {
         success {
-            echo "Deployment successful! Check Rancher UI for application status."
+            echo 'Pipeline completed successfully!'
+            echo 'To access the application:'
+            sh '''
+            export NODE_PORT=$(kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get svc html-app-service -o jsonpath='{.spec.ports[0].nodePort}')
+            echo "Application is accessible at: http://<node-ip>:$NODE_PORT"
+            '''
         }
         failure {
-            echo "Deployment failed! Check Jenkins and Rancher logs for details."
+            echo 'Pipeline failed.'
         }
         always {
-            // Cleanup
-            sh """
-                docker rmi ${DOCKER_IMAGE}:${BUILD_NUMBER} || true
-                docker rmi ${DOCKER_IMAGE}:latest || true
-            """
+            // Cleanup temporary files
+            sh '''
+            rm -f deployment.yaml service.yaml || true
+            docker rmi ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} || true
+            '''
         }
     }
 }
