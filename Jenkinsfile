@@ -1,74 +1,130 @@
 pipeline {
     agent any
+
+    // Environment variables
     environment {
-        DOCKER_CREDENTIALS = credentials('docker-id')  
-        KUBECONFIG_CREDENTIALS = credentials('kubernetes-id')  
-        GIT_CREDENTIALS = credentials('git-id')
-        IMAGE_TAG = "${env.BUILD_ID}"
+        //  Docker Hub username 
         DOCKER_USERNAME = 'prasadreddymanda'
-        APP_NAME = 'html-app'
+        
+        //  Application name - matches your survey app
+        APP_NAME = 'survey-app'
+        
+        // Using Jenkins build number for unique image tags
+        IMAGE_TAG = "${env.BUILD_ID}"
+        
+        // Credentials 
+        DOCKER_CREDENTIALS = credentials('docker-id')
+        KUBECONFIG_CREDENTIALS = credentials('kubernetes-id')
+        GIT_CREDENTIALS = credentials('git-id')
     }
-    
+
     stages {
-        stage('Checkout') {
+        // Clean workspace before starting
+        stage('Clean Workspace') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/prasadreddymandha/645assign/tree/main',
-                        credentialsId: 'git-id'
-                    ]]
-                ])
+                cleanWs()
             }
         }
-        
+
+        // Checkout code from GitHub
+        stage('Code Checkout') {
+            steps {
+                script {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/prasadreddymandha/645assign.git',
+                            credentialsId: 'git-id'
+                        ]]
+                    ])
+                    
+                    // Verify required files exist
+                    sh '''
+                        echo "Verifying required files..."
+                        test -f survey.html || (echo "survey.html not found" && exit 1)
+                        test -f Dockerfile || (echo "Dockerfile not found" && exit 1)
+                        ls -la
+                    '''
+                }
+            }
+        }
+
+        // Build Docker image
         stage('Build Docker Image') {
             steps {
                 script {
-                    withCredentials([usernamePassword(credentialsId: 'docker-id', passwordVariable: 'DOCKER_PSW', usernameVariable: 'DOCKER_USR')]) {
-                        sh 'echo $DOCKER_PSW | docker login -u $DOCKER_USR --password-stdin'
+                    try {
+                        // Login to Docker Hub
+                        withCredentials([usernamePassword(
+                            credentialsId: 'docker-id',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )]) {
+                            sh """
+                                echo "Logging into Docker Hub..."
+                                echo \${DOCKER_PASS} | docker login -u \${DOCKER_USER} --password-stdin
+                                
+                                echo "Building Docker image..."
+                                docker build -t \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} .
+                                docker tag \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                                
+                                echo "Verifying image..."
+                                docker images | grep \${APP_NAME}
+                            """
+                        }
+                    } catch (Exception e) {
+                        error "Docker build failed: ${e.getMessage()}"
                     }
-                    image = docker.build("${DOCKER_USERNAME}/${APP_NAME}:${env.IMAGE_TAG}")
                 }
             }
         }
-        
+
+        // Push Docker image to Docker Hub
         stage('Push Docker Image') {
             steps {
                 script {
-                    docker.withRegistry('https://index.docker.io/v1/', 'docker-id') {
-                        image.push()
+                    try {
+                        echo "Pushing Docker image to Docker Hub..."
+                        sh """
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                        """
+                    } catch (Exception e) {
+                        error "Docker push failed: ${e.getMessage()}"
                     }
                 }
             }
         }
-        
+
+        // Deploy to Kubernetes
         stage('Deploy to Kubernetes') {
             steps {
                 script {
-                    // Create deployment YAML
-                    sh """
-                    cat <<EOF > deployment.yaml
+                    try {
+                        echo "Creating Kubernetes deployment and service files..."
+                        // Create Kubernetes deployment YAML
+                        sh """
+                        cat <<EOF > deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: html-app
+  name: \${APP_NAME}
   labels:
-    app: html-app
+    app: \${APP_NAME}
 spec:
   replicas: 3
   selector:
     matchLabels:
-      app: html-app
+      app: \${APP_NAME}
   template:
     metadata:
       labels:
-        app: html-app
+        app: \${APP_NAME}
     spec:
       containers:
-      - name: html-app
-        image: ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}
+      - name: \${APP_NAME}
+        image: \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
         ports:
         - containerPort: 80
         resources:
@@ -80,14 +136,13 @@ spec:
             memory: "256Mi"
 EOF
 
-                    # Create service YAML
-                    cat <<EOF > service.yaml
+                        cat <<EOF > service.yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: html-app-service
+  name: \${APP_NAME}-service
   labels:
-    app: html-app
+    app: \${APP_NAME}
 spec:
   type: NodePort
   ports:
@@ -95,51 +150,80 @@ spec:
     targetPort: 80
     protocol: TCP
   selector:
-    app: html-app
+    app: \${APP_NAME}
 EOF
+                        """
 
-                    # Create ConfigMap for HTML content
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS create configmap html-content --from-file=index.html -o yaml --dry-run=client | kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f -
-
-                    # Apply Kubernetes configurations
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f deployment.yaml
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS apply -f service.yaml
-                    """
+                        echo "Applying Kubernetes configurations..."
+                        // Apply Kubernetes configurations
+                        withKubeConfig([credentialsId: 'kubernetes-id']) {
+                            sh """
+                                kubectl apply -f deployment.yaml
+                                kubectl apply -f service.yaml
+                            """
+                        }
+                    } catch (Exception e) {
+                        error "Kubernetes deployment failed: ${e.getMessage()}"
+                    }
                 }
             }
         }
-        
+
+        // Verify the deployment
         stage('Verify Deployment') {
             steps {
                 script {
-                    sh '''
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS rollout status deployment/html-app
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get pods
-                    kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get svc html-app-service
-                    '''
+                    try {
+                        echo "Verifying deployment status..."
+                        withKubeConfig([credentialsId: 'kubernetes-id']) {
+                            sh """
+                                echo "Checking deployment rollout status..."
+                                kubectl rollout status deployment/\${APP_NAME}
+                                
+                                echo "Checking pods status..."
+                                kubectl get pods -l app=\${APP_NAME}
+                                
+                                echo "Checking service status..."
+                                kubectl get svc \${APP_NAME}-service
+                            """
+                        }
+                    } catch (Exception e) {
+                        error "Deployment verification failed: ${e.getMessage()}"
+                    }
                 }
             }
         }
     }
-    
+
+    // Post-build actions
     post {
         success {
             echo 'Pipeline completed successfully!'
-            echo 'To access the application:'
-            sh '''
-            export NODE_PORT=$(kubectl --kubeconfig=$KUBECONFIG_CREDENTIALS get svc html-app-service -o jsonpath='{.spec.ports[0].nodePort}')
-            echo "Application is accessible at: http://<node-ip>:$NODE_PORT"
-            '''
+            
+            script {
+                withKubeConfig([credentialsId: 'kubernetes-id']) {
+                    sh '''
+                        echo "Getting application access information..."
+                        NODE_PORT=$(kubectl get svc ${APP_NAME}-service -o jsonpath="{.spec.ports[0].nodePort}")
+                        echo "============================================="
+                        echo "Application is accessible at: http://<your-k8s-node-ip>:${NODE_PORT}"
+                        echo "============================================="
+                    '''
+                }
+            }
         }
         failure {
-            echo 'Pipeline failed.'
+            echo 'Pipeline failed!'
+            echo 'Check the console output to find the cause of the failure.'
         }
         always {
-            // Cleanup temporary files
+            echo 'Cleaning up resources...'
             sh '''
-            rm -f deployment.yaml service.yaml || true
-            docker rmi ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} || true
+                rm -f deployment.yaml service.yaml || true
+                docker rmi ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} || true
+                docker rmi ${DOCKER_USERNAME}/${APP_NAME}:latest || true
             '''
+            cleanWs()
         }
     }
 }
