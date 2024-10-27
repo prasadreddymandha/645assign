@@ -127,13 +127,20 @@ spec:
         image: \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
         ports:
         - containerPort: 80
+        readinessProbe:
+              httpGet:
+                path: /
+                port: 80
+              initialDelaySeconds: 5
+              periodSeconds: 5
         resources:
           limits:
-            cpu: "0.5"
-            memory: "512Mi"
-          requests:
             cpu: "0.2"
             memory: "256Mi"
+          requests:
+            cpu: "0.1"
+            memory: "128Mi"
+            
 EOF
 
                         cat <<EOF > service.yaml
