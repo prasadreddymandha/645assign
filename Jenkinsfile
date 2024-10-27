@@ -6,7 +6,7 @@ pipeline {
         //  Docker Hub username 
         DOCKER_USERNAME = 'prasadreddymanda'
         
-        //  Application name - matches your survey app
+        //  Application name
         APP_NAME = 'survey-app'
         
         // Using Jenkins build number for unique image tags
@@ -42,8 +42,8 @@ pipeline {
                     // Verify required files exist
                     sh '''
                         echo "Verifying required files..."
-                        test -f survey.html || (echo "survey.html not found" && exit 1)
-                        test -f Dockerfile || (echo "Dockerfile not found" && exit 1)
+                        test -f survey.html
+                        test -f Dockerfile
                         ls -la
                     '''
                 }
@@ -103,7 +103,6 @@ pipeline {
                 script {
                     try {
                         echo "Creating Kubernetes deployment and service files..."
-                        // Create Kubernetes deployment YAML
                         sh """
                         cat <<EOF > deployment.yaml
 apiVersion: apps/v1
@@ -127,12 +126,6 @@ spec:
         image: \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
         ports:
         - containerPort: 80
-        readinessProbe:
-              httpGet:
-                path: /
-                port: 80
-              initialDelaySeconds: 5
-              periodSeconds: 5
         resources:
           limits:
             cpu: "0.2"
@@ -140,7 +133,6 @@ spec:
           requests:
             cpu: "0.1"
             memory: "128Mi"
-            
 EOF
 
                         cat <<EOF > service.yaml
@@ -162,7 +154,6 @@ EOF
                         """
 
                         echo "Applying Kubernetes configurations..."
-                        // Apply Kubernetes configurations
                         withKubeConfig([credentialsId: 'kubernetes-id']) {
                             sh """
                                 kubectl apply -f deployment.yaml
@@ -175,50 +166,11 @@ EOF
                 }
             }
         }
-
-        // Verify the deployment
-        stage('Verify Deployment') {
-    steps {
-        script {
-            try {
-                echo "Verifying deployment status..."
-                withKubeConfig([credentialsId: 'kubernetes-id']) {
-                    sh """
-                        echo "Checking deployment status..."
-                        kubectl get pods -l app=\${APP_NAME}
-                        
-                        echo "Checking service..."
-                        kubectl get svc \${APP_NAME}-service
-                        
-                        echo "Getting application URL..."
-                        NODE_PORT=\$(kubectl get svc \${APP_NAME}-service -o jsonpath="{.spec.ports[0].nodePort}")
-                        echo "Application will be accessible at: http://<your-k8s-node-ip>:\${NODE_PORT}"
-                    """
-                }
-            } catch (Exception e) {
-                // Just print the error but don't fail
-                echo "Note: Verification showed some issues but continuing: ${e.getMessage()}"
-            }
-        }
     }
-}
 
-    // Post-build actions
     post {
         success {
             echo 'Pipeline completed successfully!'
-            
-            script {
-                withKubeConfig([credentialsId: 'kubernetes-id']) {
-                    sh '''
-                        echo "Getting application access information..."
-                        NODE_PORT=$(kubectl get svc ${APP_NAME}-service -o jsonpath="{.spec.ports[0].nodePort}")
-                        echo "============================================="
-                        echo "Application is accessible at: http://<your-k8s-node-ip>:${NODE_PORT}"
-                        echo "============================================="
-                    '''
-                }
-            }
         }
         failure {
             echo 'Pipeline failed!'
@@ -234,4 +186,4 @@ EOF
             cleanWs()
         }
     }
-}}
+}
