@@ -1,19 +1,103 @@
 pipeline {
     agent any
 
+    // Environment variables
     environment {
+        //  Docker Hub username 
         DOCKER_USERNAME = 'prasadreddymanda'
+        
+        //  Application name
         APP_NAME = 'survey-app'
-        // Using both BUILD_ID and GIT_COMMIT for better traceability
-        IMAGE_TAG = "${env.BUILD_ID}-${env.GIT_COMMIT?.take(7)}"
+        
+        // Using Jenkins build number for unique image tags
+        IMAGE_TAG = "${env.BUILD_ID}"
+        
+        // Credentials 
         DOCKER_CREDENTIALS = credentials('docker-id')
         KUBECONFIG_CREDENTIALS = credentials('kubernetes-id')
         GIT_CREDENTIALS = credentials('git-id')
     }
 
     stages {
-        // Previous stages remain the same until Deploy to Kubernetes stage
-        
+        // Clean workspace before starting
+        stage('Clean Workspace') {
+            steps {
+                cleanWs()
+            }
+        }
+
+        // Checkout code from GitHub
+        stage('Code Checkout') {
+            steps {
+                script {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/prasadreddymandha/645assign.git',
+                            credentialsId: 'git-id'
+                        ]]
+                    ])
+                    
+                    // Verify required files exist
+                    sh '''
+                        echo "Verifying required files..."
+                        test -f survey.html
+                        test -f Dockerfile
+                        ls -la
+                    '''
+                }
+            }
+        }
+
+        // Build Docker image
+        stage('Build Docker Image') {
+            steps {
+                script {
+                    try {
+                        // Login to Docker Hub
+                        withCredentials([usernamePassword(
+                            credentialsId: 'docker-id',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )]) {
+                            sh """
+                                echo "Logging into Docker Hub..."
+                                echo \${DOCKER_PASS} | docker login -u \${DOCKER_USER} --password-stdin
+                                
+                                echo "Building Docker image..."
+                                docker build -t \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} .
+                                docker tag \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                                
+                                echo "Verifying image..."
+                                docker images | grep \${APP_NAME}
+                            """
+                        }
+                    } catch (Exception e) {
+                        error "Docker build failed: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        // Push Docker image to Docker Hub
+        stage('Push Docker Image') {
+            steps {
+                script {
+                    try {
+                        echo "Pushing Docker image to Docker Hub..."
+                        sh """
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                        """
+                    } catch (Exception e) {
+                        error "Docker push failed: ${e.getMessage()}"
+                    }
+                }
+            }
+        }
+
+        // Deploy to Kubernetes
         stage('Deploy to Kubernetes') {
             steps {
                 script {
@@ -29,11 +113,6 @@ metadata:
     app: \${APP_NAME}
 spec:
   replicas: 3
-  strategy:
-    type: RollingUpdate
-    rollingUpdate:
-      maxSurge: 1
-      maxUnavailable: 0
   selector:
     matchLabels:
       app: \${APP_NAME}
@@ -41,13 +120,10 @@ spec:
     metadata:
       labels:
         app: \${APP_NAME}
-      annotations:
-        kubernetes.io/change-cause: "Build: \${IMAGE_TAG}"
     spec:
       containers:
       - name: \${APP_NAME}
         image: \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
-        imagePullPolicy: Always
         ports:
         - containerPort: 80
         resources:
@@ -57,18 +133,6 @@ spec:
           requests:
             cpu: "0.1"
             memory: "128Mi"
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 5
-          periodSeconds: 10
-        readinessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 5
-          periodSeconds: 10
 EOF
 
                         cat <<EOF > service.yaml
@@ -94,10 +158,6 @@ EOF
                             sh """
                                 kubectl apply -f deployment.yaml
                                 kubectl apply -f service.yaml
-                                # Force rolling update
-                                kubectl rollout restart deployment \${APP_NAME}
-                                # Wait for rollout to complete
-                                kubectl rollout status deployment \${APP_NAME} --timeout=300s
                             """
                         }
                     } catch (Exception e) {
@@ -111,7 +171,6 @@ EOF
     post {
         success {
             echo 'Pipeline completed successfully!'
-            echo "Deployed image: ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}"
         }
         failure {
             echo 'Pipeline failed!'
@@ -122,6 +181,7 @@ EOF
             sh '''
                 rm -f deployment.yaml service.yaml || true
                 docker rmi ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} || true
+                docker rmi ${DOCKER_USERNAME}/${APP_NAME}:latest || true
             '''
             cleanWs()
         }
