@@ -14,13 +14,13 @@ pipeline {
     stages {
         // Previous stages remain the same until Deploy to Kubernetes stage
         
-        stage('Deploy to Kubernetes') {
-            steps {
-                script {
-                    try {
-                        echo "Creating Kubernetes deployment and service files..."
-                        sh """
-                        cat <<EOF > deployment.yaml
+       stage('Deploy to Kubernetes') {
+    steps {
+        script {
+            try {
+                echo "Creating Kubernetes deployment and service files..."
+                sh """
+                cat <<EOF > deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,7 +33,7 @@ spec:
     type: RollingUpdate
     rollingUpdate:
       maxSurge: 1
-      maxUnavailable: 0
+      maxUnavailable: 1
   selector:
     matchLabels:
       app: \${APP_NAME}
@@ -42,7 +42,7 @@ spec:
       labels:
         app: \${APP_NAME}
       annotations:
-        kubernetes.io/change-cause: "Build: \${IMAGE_TAG}"
+        rollme: "\${env.BUILD_ID}"
     spec:
       containers:
       - name: \${APP_NAME}
@@ -52,26 +52,31 @@ spec:
         - containerPort: 80
         resources:
           limits:
+            cpu: "0.5"
+            memory: "512Mi"
+          requests:
             cpu: "0.2"
             memory: "256Mi"
-          requests:
-            cpu: "0.1"
-            memory: "128Mi"
-        livenessProbe:
-          httpGet:
-            path: /
-            port: 80
-          initialDelaySeconds: 5
-          periodSeconds: 10
         readinessProbe:
           httpGet:
             path: /
             port: 80
-          initialDelaySeconds: 5
+          initialDelaySeconds: 10
+          periodSeconds: 5
+          timeoutSeconds: 2
+          successThreshold: 1
+          failureThreshold: 3
+        livenessProbe:
+          httpGet:
+            path: /
+            port: 80
+          initialDelaySeconds: 20
           periodSeconds: 10
+          timeoutSeconds: 2
+          failureThreshold: 3
 EOF
 
-                        cat <<EOF > service.yaml
+                cat <<EOF > service.yaml
 apiVersion: v1
 kind: Service
 metadata:
@@ -87,25 +92,45 @@ spec:
   selector:
     app: \${APP_NAME}
 EOF
-                        """
+                """
 
-                        echo "Applying Kubernetes configurations..."
-                        withKubeConfig([credentialsId: 'kubernetes-id']) {
-                            sh """
-                                kubectl apply -f deployment.yaml
-                                kubectl apply -f service.yaml
-                                # Force rolling update
-                                kubectl rollout restart deployment \${APP_NAME}
-                                # Wait for rollout to complete
-                                kubectl rollout status deployment \${APP_NAME} --timeout=300s
-                            """
-                        }
-                    } catch (Exception e) {
-                        error "Kubernetes deployment failed: ${e.getMessage()}"
-                    }
+                echo "Applying Kubernetes configurations..."
+                withKubeConfig([credentialsId: 'kubernetes-id']) {
+                    sh """
+                        # Delete any failed pods first
+                        kubectl delete pods --field-selector status.phase=Failed -n default
+                        
+                        # Apply new configurations
+                        kubectl apply -f deployment.yaml
+                        kubectl apply -f service.yaml
+                        
+                        # Wait for service to be available
+                        echo "Waiting for service..."
+                        kubectl wait --for=condition=available --timeout=60s service/\${APP_NAME}-service
+                        
+                        # Perform rolling update with increased timeout
+                        echo "Starting rollout..."
+                        kubectl rollout restart deployment \${APP_NAME}
+                        kubectl rollout status deployment \${APP_NAME} --timeout=600s
+                        
+                        # Verify deployment
+                        echo "Verifying deployment..."
+                        kubectl get pods -l app=\${APP_NAME}
+                    """
                 }
+            } catch (Exception e) {
+                // Print more detailed error information
+                sh """
+                    echo "Deployment failed. Checking pod status..."
+                    kubectl get pods -l app=\${APP_NAME}
+                    echo "Pod details:"
+                    kubectl describe pods -l app=\${APP_NAME}
+                """
+                error "Kubernetes deployment failed: ${e.getMessage()}"
             }
         }
+    }
+}
     }
 
     post {
