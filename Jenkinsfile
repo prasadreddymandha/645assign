@@ -109,7 +109,6 @@ apiVersion: apps/v1
 kind: Deployment
 metadata:
   name: \${APP_NAME}
-  imagePullPolicy: Always
   labels:
     app: \${APP_NAME}
 spec:
