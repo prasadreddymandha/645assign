@@ -4,7 +4,7 @@ pipeline {
     environment {
         DOCKER_USERNAME = 'prasadreddymanda'
         APP_NAME = 'survey-app'
-        IMAGE_TAG = "${BUILD_NUMBER}-${GIT_COMMIT?.substring(0,7)}"
+        IMAGE_TAG = "${BUILD_NUMBER}"
         DOCKER_CREDENTIALS = credentials('docker-id')
         KUBECONFIG_CREDENTIALS = credentials('kubernetes-id')
         GIT_CREDENTIALS = credentials('git-id')
@@ -19,37 +19,48 @@ pipeline {
 
         stage('Code Checkout') {
             steps {
-                checkout([
-                    $class: 'GitSCM',
-                    branches: [[name: '*/main']],
-                    userRemoteConfigs: [[
-                        url: 'https://github.com/prasadreddymandha/645assign.git',
-                        credentialsId: 'git-id'
-                    ]]
-                ])
-                
-                sh '''
-                    echo "Verifying required files..."
-                    test -f survey.html
-                    test -f Dockerfile
-                    ls -la
-                '''
+                script {
+                    checkout([
+                        $class: 'GitSCM',
+                        branches: [[name: '*/main']],
+                        userRemoteConfigs: [[
+                            url: 'https://github.com/prasadreddymandha/645assign.git',
+                            credentialsId: 'git-id'
+                        ]]
+                    ])
+                    
+                    sh '''
+                        echo "Verifying required files..."
+                        test -f survey.html
+                        test -f Dockerfile
+                        ls -la
+                    '''
+                }
             }
         }
 
         stage('Build Docker Image') {
             steps {
                 script {
-                    withCredentials([usernamePassword(
-                        credentialsId: 'docker-id',
-                        usernameVariable: 'DOCKER_USER',
-                        passwordVariable: 'DOCKER_PASS'
-                    )]) {
-                        sh """
-                            echo \$DOCKER_PASS | docker login -u \$DOCKER_USER --password-stdin
-                            docker build -t ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} .
-                            docker images | grep ${APP_NAME}
-                        """
+                    try {
+                        withCredentials([usernamePassword(
+                            credentialsId: 'docker-id',
+                            usernameVariable: 'DOCKER_USER',
+                            passwordVariable: 'DOCKER_PASS'
+                        )]) {
+                            sh """
+                                echo \${DOCKER_PASS} | docker login -u \${DOCKER_USER} --password-stdin
+                                
+                                echo "Building Docker image..."
+                                docker build -t \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} .
+                                docker tag \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG} \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                                
+                                echo "Verifying image..."
+                                docker images | grep \${APP_NAME}
+                            """
+                        }
+                    } catch (Exception e) {
+                        error "Docker build failed: ${e.getMessage()}"
                     }
                 }
             }
@@ -57,7 +68,17 @@ pipeline {
 
         stage('Push Docker Image') {
             steps {
-                sh "docker push ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}"
+                script {
+                    try {
+                        echo "Pushing Docker image to Docker Hub..."
+                        sh """
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
+                            docker push \${DOCKER_USERNAME}/\${APP_NAME}:latest
+                        """
+                    } catch (Exception e) {
+                        error "Docker push failed: ${e.getMessage()}"
+                    }
+                }
             }
         }
 
@@ -66,13 +87,14 @@ pipeline {
                 script {
                     try {
                         echo "Creating Kubernetes deployment and service files..."
-                        writeFile file: 'deployment.yaml', text: """
+                        sh """
+                        cat <<EOF > deployment.yaml
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: ${APP_NAME}
+  name: \${APP_NAME}
   labels:
-    app: ${APP_NAME}
+    app: \${APP_NAME}
 spec:
   replicas: 3
   strategy:
@@ -82,17 +104,17 @@ spec:
       maxUnavailable: 1
   selector:
     matchLabels:
-      app: ${APP_NAME}
+      app: \${APP_NAME}
   template:
     metadata:
       labels:
-        app: ${APP_NAME}
+        app: \${APP_NAME}
       annotations:
-        rollme: "${BUILD_NUMBER}"
+        rollme: "\${BUILD_NUMBER}"
     spec:
       containers:
-      - name: ${APP_NAME}
-        image: ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}
+      - name: \${APP_NAME}
+        image: \${DOCKER_USERNAME}/\${APP_NAME}:\${IMAGE_TAG}
         imagePullPolicy: Always
         ports:
         - containerPort: 80
@@ -103,15 +125,15 @@ spec:
           requests:
             cpu: "0.2"
             memory: "256Mi"
-"""
+EOF
 
-                        writeFile file: 'service.yaml', text: """
+                        cat <<EOF > service.yaml
 apiVersion: v1
 kind: Service
 metadata:
-  name: ${APP_NAME}-service
+  name: \${APP_NAME}-service
   labels:
-    app: ${APP_NAME}
+    app: \${APP_NAME}
 spec:
   type: NodePort
   ports:
@@ -119,36 +141,34 @@ spec:
     targetPort: 80
     protocol: TCP
   selector:
-    app: ${APP_NAME}
-"""
+    app: \${APP_NAME}
+EOF
+                        """
 
                         echo "Applying Kubernetes configurations..."
-                        withKubeConfig([credentialsId: 'kubernetes-id', serverUrl: 'https://your-k8s-api-server:6443']) {
+                        withKubeConfig([credentialsId: 'kubernetes-id']) {
                             sh """
-                                kubectl config current-context
-                                kubectl config view
+                                # Verify Kubernetes connection
+                                kubectl get nodes
                                 
-                                # Apply configurations
+                                # Apply new configurations
                                 kubectl apply -f deployment.yaml
                                 kubectl apply -f service.yaml
                                 
-                                # Wait for deployment
-                                kubectl rollout restart deployment ${APP_NAME}
-                                kubectl rollout status deployment ${APP_NAME} --timeout=300s
+                                # Force rolling update
+                                kubectl rollout restart deployment \${APP_NAME}
                                 
-                                # Verify deployment
-                                kubectl get pods -l app=${APP_NAME}
-                                kubectl get services ${APP_NAME}-service
+                                # Wait for rollout to finish
+                                kubectl rollout status deployment \${APP_NAME} --timeout=300s
                             """
                         }
                     } catch (Exception e) {
                         sh """
-                            echo "Deployment failed. Checking pod status..."
-                            kubectl get pods -l app=${APP_NAME}
-                            kubectl describe pods -l app=${APP_NAME}
-                            kubectl get events --sort-by='.metadata.creationTimestamp'
+                            echo "Deployment failed. Checking status..."
+                            kubectl get pods -l app=\${APP_NAME}
+                            kubectl describe deployment \${APP_NAME}
                         """
-                        throw e
+                        error "Kubernetes deployment failed: ${e.getMessage()}"
                     }
                 }
             }
@@ -157,19 +177,19 @@ spec:
 
     post {
         success {
-            echo "Pipeline completed successfully!"
-            echo "Deployed image: ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG}"
+            echo 'Pipeline completed successfully!'
         }
         failure {
-            echo "Pipeline failed!"
-            echo "Check the console output to find the cause of the failure."
+            echo 'Pipeline failed!'
+            echo 'Check the console output to find the cause of the failure.'
         }
         always {
-            echo "Cleaning up resources..."
-            sh """
+            echo 'Cleaning up resources...'
+            sh '''
                 rm -f deployment.yaml service.yaml || true
                 docker rmi ${DOCKER_USERNAME}/${APP_NAME}:${IMAGE_TAG} || true
-            """
+                docker rmi ${DOCKER_USERNAME}/${APP_NAME}:latest || true
+            '''
             cleanWs()
         }
     }
